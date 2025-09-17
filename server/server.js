@@ -1,10 +1,7 @@
 /**
  * server/server.js
- * نسخة معدّلة: أضفت قفل per-person لمنع السباقات عند تعديل الأرصدة، تحسين الحفظ على القرص (atomic write),
- * تسجيل مفصّل لتغييرات الرصيد، وحماية أبسط عند تحميل/حفظ DB لإيقاف إعادة تهيئة غير مقصودة.
- *
- * **المطلوب من الناشر:** تشغيل هذا الملف في بيئة Node واحدة (single-process). لو كان التطبيق يعمل
- * في عدة عمليات/حاويات متزامنة يجب استخدام قفل موزّع (Redis/DB) بدلاً من الـ in-memory Set هنا.
+ * نسخة معدّلة بسيطة: يطبع ردود Telegram للتشخيص، يدعم BOT_NOTIFY_TOKEN و BOT_NOTIFY_CHAT من env،
+ * ويمد endpoint mark-read ليدعم body أو param، ويعيد تهيئة flags المرتبطة بالباج.
  */
 
 const express = require('express');
@@ -45,10 +42,6 @@ const CFG = {
 };
 
 const DATA_FILE = path.join(__dirname, 'data.json');
-const DATA_TMP = path.join(__dirname, 'data.json.tmp');
-
-// in-memory per-person processing lock to avoid race conditions on balance update
-const processingPersonal = new Set();
 
 function loadData(){
   try{
@@ -63,85 +56,29 @@ function loadData(){
         blocked: [],
         tgOffsets: {}
       };
-      // write atomically
-      fs.writeFileSync(DATA_TMP, JSON.stringify(init, null, 2));
-      fs.renameSync(DATA_TMP, DATA_FILE);
+      fs.writeFileSync(DATA_FILE, JSON.stringify(init, null, 2));
       return init;
     }
     const raw = fs.readFileSync(DATA_FILE,'utf8');
-    try {
-      const parsed = JSON.parse(raw || '{}');
-      // ensure basic structure
-      parsed.profiles = Array.isArray(parsed.profiles) ? parsed.profiles : [];
-      parsed.orders = Array.isArray(parsed.orders) ? parsed.orders : [];
-      parsed.charges = Array.isArray(parsed.charges) ? parsed.charges : [];
-      parsed.offers = Array.isArray(parsed.offers) ? parsed.offers : [];
-      parsed.notifications = Array.isArray(parsed.notifications) ? parsed.notifications : [];
-      parsed.profileEditRequests = parsed.profileEditRequests || {};
-      parsed.blocked = Array.isArray(parsed.blocked) ? parsed.blocked : [];
-      parsed.tgOffsets = parsed.tgOffsets || {};
-      return parsed;
-    } catch(parseErr){
-      console.error('loadData: JSON parse error - backing up corrupted file', parseErr);
-      // rename corrupted file so it's not overwritten, and create a fresh DB skeleton
-      const corruptPath = path.join(__dirname, `data.json.corrupt.${Date.now()}`);
-      try { fs.renameSync(DATA_FILE, corruptPath); console.warn('Corrupted DB moved to', corruptPath); } catch(e){ console.warn('Could not move corrupted DB', e); }
-      const init = {
-        profiles: [],
-        orders: [],
-        charges: [],
-        offers: [],
-        notifications: [],
-        profileEditRequests: {},
-        blocked: [],
-        tgOffsets: {}
-      };
-      fs.writeFileSync(DATA_TMP, JSON.stringify(init, null, 2));
-      fs.renameSync(DATA_TMP, DATA_FILE);
-      return init;
-    }
+    return JSON.parse(raw || '{}');
   }catch(e){
     console.error('loadData error', e);
     return { profiles:[], orders:[], charges:[], offers:[], notifications:[], profileEditRequests:{}, blocked:[], tgOffsets:{} };
   }
 }
-
-// atomic save: write to temp then rename
-function saveData(d){
-  try{
-    fs.writeFileSync(DATA_TMP, JSON.stringify(d, null, 2));
-    fs.renameSync(DATA_TMP, DATA_FILE);
-  }catch(e){
-    console.error('saveData error', e);
-    // best-effort: try direct write (fallback)
-    try { fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2)); } catch(err){ console.error('fallback save failed', err); }
-  }
-}
-
+function saveData(d){ try{ fs.writeFileSync(DATA_FILE, JSON.stringify(d, null, 2)); }catch(e){ console.error('saveData error', e); } }
 let DB = loadData();
 
 function findProfileByPersonal(n){
   return DB.profiles.find(p => String(p.personalNumber) === String(n)) || null;
 }
-
-/**
- * ensureProfile: ينشئ بروفايل جديد فقط إذا لم يوجد.
- * ملاحظة: إذا كان البروفايل موجودًا بالفعل ولا يحتوي على حقل balance، نتركه كما هو
- * إلا إذا كان undefined وفي هذه الحالة نهيئ الحقل فقط (لا نعيد تهيئة الرصيد إلى 0
- * إن كان هنالك حالات أخرى تشير إلى فقدان البيانات).
- */
 function ensureProfile(personal){
   let p = findProfileByPersonal(personal);
   if(!p){
     p = { personalNumber: String(personal), name: 'ضيف', email:'', phone:'', password:'', balance: 0, canEdit:false };
-    DB.profiles.push(p);
-    saveData(DB);
+    DB.profiles.push(p); saveData(DB);
   } else {
-    if(typeof p.balance === 'undefined' || p.balance === null || Number.isNaN(Number(p.balance))) {
-      // only set when undefined/null/NaN
-      p.balance = 0;
-      saveData(DB);
-    }
+    if(typeof p.balance === 'undefined') p.balance = 0;
   }
   return p;
 }
@@ -200,7 +137,7 @@ app.post('/api/register', async (req,res)=>{
     p.email = email || p.email;
     p.password = password || p.password;
     p.phone = phone || p.phone;
-    if(typeof p.balance === 'undefined' || p.balance === null || Number.isNaN(Number(p.balance))) p.balance = 0;
+    if(typeof p.balance === 'undefined') p.balance = 0;
   }
   saveData(DB);
 
@@ -309,60 +246,25 @@ app.post('/api/help', async (req,res)=>{
   }
 });
 
-/**
- * create order (supports paidWithBalance server-side)
- * - إضافة حماية per-person لمنع طلبين متزامنين من تعديل الرصيد في آنٍ واحد.
- * - تسجيل تفصيلي عند تعديل الرصيد.
- */
+// create order (supports paidWithBalance server-side)
 app.post('/api/orders', async (req,res)=>{
   const { personal, phone, type, item, idField, fileLink, cashMethod, paidWithBalance, paidAmount } = req.body;
   if(!personal || !type || !item) return res.status(400).json({ ok:false, error:'missing fields' });
-
-  // Ensure profile exists (creates if absent).
   const prof = ensureProfile(personal);
 
-  // If paid with balance, perform atomic check-and-decrement protected by lock
   if(paidWithBalance){
-    const personalStr = String(personal);
-    // simple per-person lock
-    if(processingPersonal.has(personalStr)){
-      return res.status(429).json({ ok:false, error:'busy_processing' });
-    }
-    processingPersonal.add(personalStr);
-    try {
-      const price = Number(paidAmount || 0);
-      if(isNaN(price) || price <= 0) {
-        return res.status(400).json({ ok:false, error:'invalid_paid_amount' });
-      }
-      // reload profile reference in case DB changed
-      const freshProf = findProfileByPersonal(personalStr);
-      if(!freshProf) {
-        return res.status(404).json({ ok:false, error:'profile_not_found' });
-      }
-      const currentBal = Number(freshProf.balance || 0);
-      if(currentBal < price) {
-        return res.status(402).json({ ok:false, error:'insufficient_balance' });
-      }
-      const oldBalance = currentBal;
-      freshProf.balance = currentBal - price;
-      // log the update for debugging
-      console.log(`[BALANCE_UPDATE] personal=${personalStr} old=${oldBalance} new=${freshProf.balance} reason=order item=${item} amount=${price}`);
-      if(!DB.notifications) DB.notifications = [];
-      DB.notifications.unshift({
-        id: String(Date.now()) + '-charge',
-        personal: String(freshProf.personalNumber),
-        text: `تم خصم ${price.toLocaleString('en-US')} ل.س من رصيدك لطلب: ${item}`,
-        read: false,
-        createdAt: new Date().toISOString()
-      });
-      // persist immediately
-      saveData(DB);
-    } catch(e){
-      console.error('orders paidWithBalance handler error', e);
-      return res.status(500).json({ ok:false, error:'server_error' });
-    } finally {
-      processingPersonal.delete(personalStr);
-    }
+    const price = Number(paidAmount || 0);
+    if(isNaN(price) || price <= 0) return res.status(400).json({ ok:false, error:'invalid_paid_amount' });
+    if(Number(prof.balance || 0) < price) return res.status(402).json({ ok:false, error:'insufficient_balance' });
+    prof.balance = Number(prof.balance || 0) - price;
+    if(!DB.notifications) DB.notifications = [];
+    DB.notifications.unshift({
+      id: String(Date.now()) + '-charge',
+      personal: String(prof.personalNumber),
+      text: `تم خصم ${price.toLocaleString('en-US')} ل.س من رصيدك لطلب: ${item}`,
+      read: false,
+      createdAt: new Date().toISOString()
+    });
   }
 
   const orderId = Date.now();
@@ -397,17 +299,13 @@ app.post('/api/orders', async (req,res)=>{
     }
   }catch(e){ console.warn('send order failed', e); }
   saveData(DB);
-  return res.json({ ok: true, order: order, profile: findProfileByPersonal(personal) });
+  return res.json({ ok: true, order: order, profile: prof });
 });
 
-/**
- * charge (طلب شحن رصيد)
- * لا نعدّل الرصيد هنا مباشرة - سيتم تعديل الرصيد عندما يرد المشرف في التليجرام عبر handler
- * لكن نحفظ طلب الشحن ونرسله للتليجرام.
- */
+// charge (طلب شحن رصيد)
 app.post('/api/charge', async (req,res)=>{
   const { personal, phone, amount, method, fileLink } = req.body;
-  if(!personal || typeof amount === 'undefined') return res.status(400).json({ ok:false, error:'missing fields' });
+  if(!personal || !amount) return res.status(400).json({ ok:false, error:'missing fields' });
   const prof = ensureProfile(personal);
   const chargeId = Date.now();
   const charge = {
@@ -544,11 +442,6 @@ async function genericBotReplyHandler(update){
   const msg = update.message;
   const text = String(msg.text || '').trim();
 
-  // log incoming message for debugging
-  try {
-    console.log('[TG MSG] from:', (msg.from && msg.from.username) ? msg.from.username : (msg.from && msg.from.id) || 'unknown', 'text:', text);
-  } catch(e){ /* ignore logging errors */ }
-
   if(msg.reply_to_message && msg.reply_to_message.message_id){
     const repliedId = msg.reply_to_message.message_id;
 
@@ -583,40 +476,22 @@ async function genericBotReplyHandler(update){
       if(m && mPersonal){
         const amount = Number(m[1]);
         const personal = String(mPersonal[1]);
-        // protect balance update with per-person lock
-        const personalStr = String(personal);
-        if(processingPersonal.has(personalStr)){
-          console.warn('Skipping balance update because personal is locked:', personalStr);
-        } else {
-          processingPersonal.add(personalStr);
-          try {
-            const prof = findProfileByPersonal(personal);
-            if(prof){
-              const old = Number(prof.balance || 0);
-              prof.balance = old + amount;
-              ch.status = 'تم تحويل الرصيد';
-              ch.replied = true;
-              saveData(DB);
-              console.log(`[BALANCE_UPDATE] personal=${personalStr} old=${old} new=${prof.balance} reason=charge id=${ch.id} amount=${amount}`);
-              if(!DB.notifications) DB.notifications = [];
-              DB.notifications.unshift({
-                id: String(Date.now()) + '-balance',
-                personal: String(prof.personalNumber),
-                text: `تم شحن رصيدك بمبلغ ${amount.toLocaleString('en-US')} ل.س. رصيدك الآن: ${(prof.balance||0).toLocaleString('en-US')} ل.س`,
-                read: false,
-                createdAt: new Date().toISOString()
-              });
-              saveData(DB);
-            } else {
-              console.warn('Charge reply references non-existing profile:', personalStr);
-            }
-          } catch(e){
-            console.error('error applying charge reply', e);
-          } finally {
-            processingPersonal.delete(personalStr);
-          }
+        const prof = findProfileByPersonal(personal);
+        if(prof){
+          prof.balance = (prof.balance || 0) + amount;
+          ch.status = 'تم تحويل الرصيد';
+          ch.replied = true;
+          saveData(DB);
+          if(!DB.notifications) DB.notifications = [];
+          DB.notifications.unshift({
+            id: String(Date.now()) + '-balance',
+            personal: String(prof.personalNumber),
+            text: `تم شحن رصيدك بمبلغ ${amount.toLocaleString('en-US')} ل.س. رصيدك الآن: ${(prof.balance||0).toLocaleString('en-US')} ل.س`,
+            read: false,
+            createdAt: new Date().toISOString()
+          });
+          saveData(DB);
         }
-        return;
       } else {
         if(/^(تم|مقبول|accept)/i.test(text)) { ch.status = 'تم شحن الرصيد'; ch.replied = true; saveData(DB); }
         else if(/^(رفض|مرفوض|reject)/i.test(text)) { ch.status = 'تم رفض الطلب'; ch.replied = true; saveData(DB); }
