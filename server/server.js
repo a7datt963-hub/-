@@ -427,7 +427,6 @@ app.post('/api/orders', async (req,res)=>{
       read: false,
       createdAt: new Date().toISOString()
     });
-  }
 
   const orderId = Date.now();
   const order = {
