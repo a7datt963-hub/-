@@ -587,11 +587,102 @@ setInterval(pollAllBots, 2500);
 // debug endpoints
 app.get('/api/debug/db', (req,res)=> res.json({ ok:true, size: { profiles: DB.profiles.length, orders: DB.orders.length, charges: DB.charges.length, offers: DB.offers.length, notifications: (DB.notifications||[]).length }, tgOffsets: DB.tgOffsets || {} }));
 app.post('/api/debug/clear-updates', (req,res)=>{ DB.tgOffsets = {}; saveData(DB); res.json({ok:true}); });
+// === POST /api/offers/ping ===
+// ضع هذا قبل app.listen(...)
+const OFFERS_MIN_INTERVAL_MS = 3 * 60 * 1000; // 3 دقائق
+// per-IP in-memory rate limit
+const offersLimiter = {}; // { ip: { count, windowStart } }
+const OFFERS_WINDOW_MS = 60 * 1000; // 1 دقيقة
+const OFFERS_MAX_PER_WINDOW = 10;   // حد مرن
 
-app.listen(PORT, ()=> {
-  console.log(`Server listening on ${PORT}`);
-  DB = loadData();
-  console.log('DB loaded items:', DB.profiles.length, 'profiles');
+// optional secret header check - ضع قيمة KEEP_PING_SECRET في env إذا أردت التحقق
+const KEEP_PING_SECRET = process.env.KEEP_PING_SECRET || ''; // ضعها في env أو اتركها فارغة
+
+app.post('/api/offers/ping', async (req, res) => {
+  try {
+    const ip = req.ip || (req.headers['x-forwarded-for'] || '').split(',')[0] || req.connection.remoteAddress || 'unknown';
+    const now = Date.now();
+
+    // per-ip limiter
+    const st = offersLimiter[ip] || { count: 0, windowStart: now };
+    if(now - st.windowStart > OFFERS_WINDOW_MS){
+      st.windowStart = now;
+      st.count = 0;
+    }
+    st.count++;
+    offersLimiter[ip] = st;
+    if(st.count > OFFERS_MAX_PER_WINDOW){
+      return res.status(429).json({ ok:false, error:'rate_limited' });
+    }
+
+    // optional secret header validation
+    if(KEEP_PING_SECRET){
+      const h = req.headers['x-keep-secret'] || '';
+      if(String(h) !== String(KEEP_PING_SECRET)){
+        // reject unauthenticated pings
+        return res.status(401).json({ ok:false, error:'invalid_secret' });
+      }
+    }
+
+    // reload DB for latest meta
+    DB = loadData();
+    if(!DB.meta) DB.meta = {};
+    const lastSentAt = DB.meta.lastOffersSentAt ? new Date(DB.meta.lastOffersSentAt).getTime() : 0;
+
+    // if last sent less than MIN_INTERVAL, just acknowledge (no telegram)
+    if(now - lastSentAt < OFFERS_MIN_INTERVAL_MS){
+      return res.json({ ok:true, sent:false, reason:'too_recent', lastSent: DB.meta.lastOffersSentAt || null });
+    }
+
+    // mark lastOffersSentAt immediately to avoid races (idempotency)
+    DB.meta.lastOffersSentAt = new Date().toISOString();
+    saveData(DB);
+
+    // build telegram message
+    const body = req.body || {};
+    const personal = body.personal ? String(body.personal) : 'غير معروف';
+    const page = body.page ? String(body.page) : (req.headers.referer || 'unknown');
+    const ua = body.ua ? String(body.ua).substring(0,200) : (req.headers['user-agent'] || '').substring(0,200);
+
+    const botToken = CFG.BOT_OFFERS_TOKEN;
+    const botChat = CFG.BOT_OFFERS_CHAT;
+
+    if(!botToken || !botChat){
+      console.log('[offers-ping] BOT_OFFERS_TOKEN or BOT_OFFERS_CHAT not set; skipping telegram');
+      return res.json({ ok:true, sent:false, reason:'bot_not_configured' });
+    }
+
+    try {
+      const parts = [
+        '📣 إشعار عروض/هدايا (Ping من الواجهة)',
+        `المستخدم: ${personal}`,
+        `الصفحة: ${page}`,
+        `الوقت: ${new Date().toLocaleString()}`,
+        `UA: ${ua}`
+      ];
+      const text = parts.join('\n');
+
+      const r = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: botChat, text, parse_mode: 'HTML' })
+      });
+      const j = await r.json().catch(()=>null);
+      if(!r.ok || !j || !j.ok){
+        console.warn('[offers-ping] telegram send failed', r.status, j);
+        // You might want to rollback DB.meta.lastOffersSentAt here if critical
+        return res.status(502).json({ ok:false, error:'tg_failed', details: j || null });
+      }
+      return res.json({ ok:true, sent:true, tg: j.result || null });
+    } catch(err){
+      console.warn('[offers-ping] telegram error', err);
+      return res.status(500).json({ ok:false, error:'server_error' });
+    }
+
+  } catch(err){
+    console.error('/api/offers/ping error', err);
+    return res.status(500).json({ ok:false, error:'internal' });
+  }
 });
 // === /api/redeem-gift with Telegram notify ===
 app.post('/api/redeem-gift', (req, res) => {
@@ -672,4 +763,10 @@ app.post('/api/redeem-gift', (req, res) => {
 
   // return success to client with updated profile
   return res.json({ ok:true, msg:'تم اضافة الرصيد', added: amount, profile: prof });
+});
+
+app.listen(PORT, ()=> {
+  console.log(`Server listening on ${PORT}`);
+  DB = loadData();
+  console.log('DB loaded items:', DB.profiles.length, 'profiles');
 });
