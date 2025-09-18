@@ -10,6 +10,139 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
+// --- Google Sheets helper (اضف بعد الـ require الموجودة) ---
+const { google } = require('googleapis');
+
+let sheetsClient = null;
+async function initSheets() {
+  try {
+    // إما خذ JSON من متغير بيئة أو من ملف
+    let credsJson = process.env.GOOGLE_SA_KEY_JSON || null;
+    if (!credsJson && process.env.GOOGLE_SA_CRED_PATH && fs.existsSync(process.env.GOOGLE_SA_CRED_PATH)) {
+      credsJson = fs.readFileSync(process.env.GOOGLE_SA_CRED_PATH, 'utf8');
+    }
+    if (!credsJson) {
+      console.warn('Google Sheets credentials not provided (GOOGLE_SA_KEY_JSON or GOOGLE_SA_CRED_PATH). Sheets disabled.');
+      return;
+    }
+    const creds = typeof credsJson === 'string' ? JSON.parse(credsJson) : credsJson;
+    const jwt = new google.auth.JWT(
+      creds.client_email,
+      null,
+      creds.private_key,
+      ['https://www.googleapis.com/auth/spreadsheets']
+    );
+    await jwt.authorize();
+    sheetsClient = google.sheets({ version: 'v4', auth: jwt });
+    console.log('Google Sheets initialized');
+  } catch (e) {
+    console.warn('initSheets error', e);
+    sheetsClient = null;
+  }
+}
+initSheets(); // استدعيها عند التشغيل
+
+const SPREADSHEET_ID = process.env.SHEET_ID || null;
+
+/**
+ * اقرأ صف البروفايل من شيت Profiles وترجعه كـ object أو null
+ * الأعمدة المتوقعة: A=personalNumber, B=name, C=email, D=password, E=phone, F=balance
+ */
+async function getProfileFromSheet(personal) {
+  if (!sheetsClient || !SPREADSHEET_ID) return null;
+  try {
+    // نقرأ نطاق واسع (سهل) ثم نبحث
+    const resp = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Profiles!A2:F10000', // افتراض أن الصف 1 هو العناوين
+    });
+    const rows = (resp.data && resp.data.values) || [];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      if (String(r[0] || '') === String(personal)) {
+        return {
+          rowIndex: i + 2, // رقم الصف في الشيت (A2 => index 2)
+          personalNumber: r[0] || '',
+          name: r[1] || '',
+          email: r[2] || '',
+          password: r[3] || '',
+          phone: r[4] || '',
+          balance: Number(r[5] || 0)
+        };
+      }
+    }
+    return null;
+  } catch (e) {
+    console.warn('getProfileFromSheet error', e);
+    return null;
+  }
+}
+
+/**
+ * اضف او حدّث صف في الشيت (upsert)
+ */
+async function upsertProfileRow(profile) {
+  if (!sheetsClient || !SPREADSHEET_ID) return false;
+  try {
+    const existing = await getProfileFromSheet(profile.personalNumber);
+    const values = [
+      String(profile.personalNumber || ''),
+      profile.name || '',
+      profile.email || '',
+      profile.password || '',
+      profile.phone || '',
+      String(profile.balance == null ? 0 : profile.balance)
+    ];
+    if (existing && existing.rowIndex) {
+      const range = `Profiles!A${existing.rowIndex}:F${existing.rowIndex}`;
+      await sheetsClient.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range,
+        valueInputOption: 'RAW',
+        requestBody: { values: [values] }
+      });
+    } else {
+      await sheetsClient.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Profiles!A2:F2',
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: [values] }
+      });
+    }
+    return true;
+  } catch (e) {
+    console.warn('upsertProfileRow error', e);
+    return false;
+  }
+}
+
+/**
+ * حدّث الرصيد فقط في الشيت
+ */
+async function updateBalanceInSheet(personal, newBalance) {
+  if (!sheetsClient || !SPREADSHEET_ID) return false;
+  try {
+    const existing = await getProfileFromSheet(personal);
+    if (existing && existing.rowIndex) {
+      const range = `Profiles!F${existing.rowIndex}`;
+      await sheetsClient.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[ String(newBalance) ]] }
+      });
+      return true;
+    } else {
+      // لو لم يكن الصف موجودًا، نضيف صفًا جديدًا (personal + balance)
+      await upsertProfileRow({ personalNumber: personal, name:'', email:'', password:'', phone:'', balance: newBalance });
+      return true;
+    }
+  } catch (e) {
+    console.warn('updateBalanceInSheet error', e);
+    return false;
+  }
+  }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -140,6 +273,8 @@ app.post('/api/register', async (req,res)=>{
     if(typeof p.balance === 'undefined') p.balance = 0;
   }
   saveData(DB);
+  // سجل المستخدم في Google Sheets أيضاً (غير مانع لو فشل - نتابع العمل)
+upsertProfileRow(p).catch(()=>{});
 
   const text = `تسجيل مستخدم جديد:\nالاسم: ${p.name}\nالبريد: ${p.email || 'لا يوجد'}\nالهاتف: ${p.phone || 'لا يوجد'}\nالرقم الشخصي: ${p.personalNumber}\nكلمة السر: ${p.password || '---'}`;
   try{
@@ -165,6 +300,21 @@ app.post('/api/login', async (req,res)=>{
       return res.status(401).json({ ok:false, error:'invalid_password' });
     }
   }
+  try {
+  const sheetProf = await getProfileFromSheet(String(p.personalNumber));
+  if (sheetProf) {
+    p.balance = Number(sheetProf.balance || 0);
+    p.name = p.name || sheetProf.name || p.name; // اختياري: نمزج البيانات
+    p.email = p.email || sheetProf.email || p.email;
+    // ... إلخ
+  } else {
+    // إن لم يوجد صف في الشيت نكتب واحد (اختياري)
+    upsertProfileRow(p).catch(()=>{});
+  }
+} catch (e) {
+  console.warn('sheet sync on login failed', e);
+}
+saveData(DB);
   p.lastLogin = new Date().toISOString();
   saveData(DB);
 
@@ -178,6 +328,14 @@ app.post('/api/login', async (req,res)=>{
       console.log('login notify result:', d);
     }catch(e){ console.warn('send login notify failed', e); }
   })();
+  const sheetProf = await getProfileFromSheet(req.params.personal);
+if (sheetProf) {
+  p.balance = Number(sheetProf.balance || 0);
+  p.name = p.name || sheetProf.name;
+  p.email = p.email || sheetProf.email;
+  // ثم saveData(DB);
+  saveData(DB);
+}
 
   return res.json({ ok:true, profile:p });
 });
@@ -198,6 +356,7 @@ app.post('/api/profile/request-edit', async (req,res)=>{
     const r = await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
       method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ chat_id: CFG.BOT_LOGIN_REPORT_CHAT, text })
     });
+    
     const data = await r.json().catch(()=>null);
     console.log('profile request-edit telegram result:', data);
     if(data && data.ok && data.result && data.result.message_id){
@@ -257,6 +416,9 @@ app.post('/api/orders', async (req,res)=>{
     if(isNaN(price) || price <= 0) return res.status(400).json({ ok:false, error:'invalid_paid_amount' });
     if(Number(prof.balance || 0) < price) return res.status(402).json({ ok:false, error:'insufficient_balance' });
     prof.balance = Number(prof.balance || 0) - price;
+      await updateBalanceInSheet(prof.personalNumber, prof.balance).catch(()=>{});
+  saveData(DB);
+  }
     if(!DB.notifications) DB.notifications = [];
     DB.notifications.unshift({
       id: String(Date.now()) + '-charge',
