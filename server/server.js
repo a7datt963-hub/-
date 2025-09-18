@@ -593,54 +593,83 @@ app.listen(PORT, ()=> {
   DB = loadData();
   console.log('DB loaded items:', DB.profiles.length, 'profiles');
 });
-// === إضافة endpoint لاسترداد أكواد الهدايا (redeem) ===
-// أدخل هذا داخل server/server.js (بعد تعريف DB, loadData, saveData, ensureProfile)
-const GIFT_CODES = {
-  // ضع هنا الرموز والمبالغ بالل.س
-  // مثال: 'A693D0M': 500,
-  //        'FJGYFRDG': 100
-  'A693D0M': 500,
-  'FJGYFRDG': 100
-};
-
+// === /api/redeem-gift with Telegram notify ===
 app.post('/api/redeem-gift', (req, res) => {
-  const { personal, code } = req.body || {};
-  if(!personal || !code) return res.status(400).json({ ok:false, error:'missing_fields' });
-  const codeClean = String(code).trim().toUpperCase();
+  const body = req.body || {};
+  const personal = String(body.personal || body.personalNumber || req.headers['x-personal'] || '').trim();
+  const codeIn = String(body.code || body.giftCode || '').trim().toUpperCase();
 
-  // reload DB to be safe
+  if(!codeIn) return res.status(400).json({ ok:false, error:'missing_code', msg:'حقل code مطلوب' });
+  if(!personal) return res.status(400).json({ ok:false, error:'missing_personal', msg:'الرقم الشخصي مطلوب (personal)' });
+
+  // reload DB to get latest
   DB = loadData();
-  const prof = ensureProfile(personal); // creates if not exists
+  const prof = ensureProfile(personal);
 
-  // ensure redeemed list exists
   if(!Array.isArray(prof.redeemedCodes)) prof.redeemedCodes = [];
 
-  // check if already redeemed
-  if(prof.redeemedCodes.includes(codeClean)){
-    return res.json({ ok:false, error:'already_redeemed', msg:'تمت الاستفادة من هذا الرمز مسبقاً' });
+  // server-side mapping of valid codes -> amounts
+  const GIFT_CODES = {
+    'A693D0M': 500,
+    'FJGYFRDG': 100
+    // أضف رموزاً أخرى هنا حسب الحاجة
+  };
+
+  if(!Object.prototype.hasOwnProperty.call(GIFT_CODES, codeIn)){
+    console.log(`[redeem] invalid code attempt by ${personal}: ${codeIn}`);
+    return res.status(404).json({ ok:false, error:'invalid_code', msg:'الرمز غير صالح' });
   }
 
-  // check code validity on server mapping
-  if(!Object.prototype.hasOwnProperty.call(GIFT_CODES, codeClean)){
-    return res.json({ ok:false, error:'invalid_code', msg:'الرمز غير صالح' });
+  if(prof.redeemedCodes.includes(codeIn)){
+    console.log(`[redeem] already redeemed by ${personal}: ${codeIn}`);
+    return res.status(409).json({ ok:false, error:'already_redeemed', msg:'تمت الاستفادة من هذا الرمز مسبقاً' });
   }
 
-  // apply amount
-  const amount = Number(GIFT_CODES[codeClean] || 0);
+  const amount = Number(GIFT_CODES[codeIn] || 0);
   prof.balance = (Number(prof.balance || 0) + amount);
-  // mark redeemed
-  prof.redeemedCodes.push(codeClean);
+  prof.redeemedCodes.push(codeIn);
 
-  // add a notification (so it shows in UI when user fetches notifications)
+  // add an in-app notification
   if(!DB.notifications) DB.notifications = [];
   DB.notifications.unshift({
     id: String(Date.now()) + '-gift',
     personal: String(prof.personalNumber),
-    text: `تم اضافة ${amount.toLocaleString('en-US')} ل.س إلى رصيدك عن طريق رمز هدية (${codeClean})`,
+    text: `تم اضافة ${amount.toLocaleString('en-US')} ل.س إلى رصيدك عن طريق رمز هدية (${codeIn})`,
     read: false,
     createdAt: new Date().toISOString()
   });
 
+  // save DB now (so profile updated before sending telegram)
   saveData(DB);
+
+  // Prepare telegram message (Arabic)
+  const botToken = CFG.BOT_NOTIFY_TOKEN;
+  const botChat = CFG.BOT_NOTIFY_CHAT;
+  (async () => {
+    if(botToken && botChat){
+      try {
+        const userName = prof.name || 'غير معروف';
+        const text = `🔔 إشعار رمز هدية\nالمستخدم: ${userName}\nالرقم الشخصي: ${prof.personalNumber}\nالرمز: ${codeIn}\nالمبلغ: ${amount.toLocaleString('en-US')} ل.س\nالوقت: ${new Date().toLocaleString()}`;
+        // send via Telegram sendMessage
+        const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: botChat, text, parse_mode: 'HTML' })
+        });
+        const tgJson = await tgRes.json().catch(()=>null);
+        if(!tgRes.ok || !tgJson || !tgJson.ok){
+          console.warn('[redeem] telegram notify failed', tgRes.status, tgJson);
+        } else {
+          console.log('[redeem] telegram notified', codeIn, prof.personalNumber);
+        }
+      } catch (err) {
+        console.warn('[redeem] telegram notify error', err);
+      }
+    } else {
+      console.log('[redeem] telegram notify skipped (BOT_NOTIFY_TOKEN or BOT_NOTIFY_CHAT not set)');
+    }
+  })();
+
+  // return success to client with updated profile
   return res.json({ ok:true, msg:'تم اضافة الرصيد', added: amount, profile: prof });
 });
