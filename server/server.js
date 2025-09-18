@@ -593,3 +593,54 @@ app.listen(PORT, ()=> {
   DB = loadData();
   console.log('DB loaded items:', DB.profiles.length, 'profiles');
 });
+// === إضافة endpoint لاسترداد أكواد الهدايا (redeem) ===
+// أدخل هذا داخل server/server.js (بعد تعريف DB, loadData, saveData, ensureProfile)
+const GIFT_CODES = {
+  // ضع هنا الرموز والمبالغ بالل.س
+  // مثال: 'A693D0M': 500,
+  //        'FJGYFRDG': 100
+  'A693D0M': 500,
+  'FJGYFRDG': 100
+};
+
+app.post('/api/redeem-gift', (req, res) => {
+  const { personal, code } = req.body || {};
+  if(!personal || !code) return res.status(400).json({ ok:false, error:'missing_fields' });
+  const codeClean = String(code).trim().toUpperCase();
+
+  // reload DB to be safe
+  DB = loadData();
+  const prof = ensureProfile(personal); // creates if not exists
+
+  // ensure redeemed list exists
+  if(!Array.isArray(prof.redeemedCodes)) prof.redeemedCodes = [];
+
+  // check if already redeemed
+  if(prof.redeemedCodes.includes(codeClean)){
+    return res.json({ ok:false, error:'already_redeemed', msg:'تمت الاستفادة من هذا الرمز مسبقاً' });
+  }
+
+  // check code validity on server mapping
+  if(!Object.prototype.hasOwnProperty.call(GIFT_CODES, codeClean)){
+    return res.json({ ok:false, error:'invalid_code', msg:'الرمز غير صالح' });
+  }
+
+  // apply amount
+  const amount = Number(GIFT_CODES[codeClean] || 0);
+  prof.balance = (Number(prof.balance || 0) + amount);
+  // mark redeemed
+  prof.redeemedCodes.push(codeClean);
+
+  // add a notification (so it shows in UI when user fetches notifications)
+  if(!DB.notifications) DB.notifications = [];
+  DB.notifications.unshift({
+    id: String(Date.now()) + '-gift',
+    personal: String(prof.personalNumber),
+    text: `تم اضافة ${amount.toLocaleString('en-US')} ل.س إلى رصيدك عن طريق رمز هدية (${codeClean})`,
+    read: false,
+    createdAt: new Date().toISOString()
+  });
+
+  saveData(DB);
+  return res.json({ ok:true, msg:'تم اضافة الرصيد', added: amount, profile: prof });
+});
