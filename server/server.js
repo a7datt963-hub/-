@@ -302,63 +302,19 @@ app.post('/api/register', async (req,res)=>{
 });
 
 // login
-// login (محدّث) — يدعم البحث بالمجموعة name/email/password/phone
 app.post('/api/login', async (req,res)=>{
-  const { personalNumber, email, password, name, phone } = req.body || {};
+  const { personalNumber, email, password } = req.body || {};
   let p = null;
-
-  // 1) إذا أعطانا personalNumber نستخدمه مباشرة (خيار سريع)
-  if(personalNumber){
-    p = findProfileByPersonal(personalNumber);
-  } else {
-    // 2) حاول إيجاد ملف يطابق الحقول المرسلة (نعتبر المطابقة دقيقة على الحقول المرسلة)
-    p = DB.profiles.find(x => {
-      // إذا أرسلت إيميل وموجود في السجل: اعتبره مطابقاً بشكل أقوى
-      if(email && x.email && x.email.toLowerCase() === String(email).toLowerCase()){
-        // إذا يوجد password في السجل وتَوفّر في الطلب فتأكد منه لاحقاً
-        return true;
-      }
-      // وإلا: تحقق من كل الحقول التي أرسلتها (إذا أرسلتها)
-      let ok = true;
-      if(name) ok = ok && String(x.name || '') === String(name);
-      if(phone) ok = ok && String(x.phone || '') === String(phone);
-      if(email) ok = ok && String((x.email||'').toLowerCase()) === String((email||'').toLowerCase());
-      if(password) ok = ok && (typeof x.password !== 'undefined' ? String(x.password) === String(password) : false);
-      return ok;
-    }) || null;
-  }
-
-  // 3) لو وجد ملف وتبين أن له كلمة سر مسجلة وتقدّم المستخدم بكلمة سر خاطئة => 401
-  if(p && typeof p.password !== 'undefined' && String(p.password).length > 0) {
-    if(typeof password === 'undefined' || String(password) !== String(p.password)) {
+  if(personalNumber) p = findProfileByPersonal(personalNumber);
+  else if(email) p = DB.profiles.find(x => x.email && x.email.toLowerCase() === String(email).toLowerCase()) || null;
+  if(!p) return res.status(404).json({ ok:false, error:'not_found' });
+  if(typeof p.password !== 'undefined' && String(p.password).length > 0){
+    if(typeof password === 'undefined' || String(password) !== String(p.password)){
       return res.status(401).json({ ok:false, error:'invalid_password' });
     }
   }
 
-  // 4) إذا ما وجدنا ملف: ننشئ ملف جديد برقم شخصي عشوائي فريد (7 أرقام)
-  if(!p){
-    let newPersonal;
-    do {
-      newPersonal = String(Math.floor(1000000 + Math.random() * 9000000)); // 7 أرقام
-    } while(findProfileByPersonal(newPersonal));
-
-    p = {
-      personalNumber: String(newPersonal),
-      name: name || 'غير معروف',
-      email: email || '',
-      password: password || '',
-      phone: phone || '',
-      balance: 0,
-      canEdit: false
-    };
-    DB.profiles.push(p);
-    saveData(DB);
-
-    // أضف صف في الـ Google Sheets (غير حرج لو فشل)
-    upsertProfileRow(p).catch(()=>{});
-  }
-
-  // 5) مزامنة الرصيد والبيانات من Google Sheets إن وُجد صف مطابق للـ personalNumber
+  // sync from sheet if available
   try {
     const sheetProf = await getProfileFromSheet(String(p.personalNumber));
     if (sheetProf) {
@@ -367,28 +323,33 @@ app.post('/api/login', async (req,res)=>{
       p.email = p.email || sheetProf.email || p.email;
       saveData(DB);
     } else {
-      // لو ما في صف — نُحاول كتابة الملف للـ Sheet (upsert)
       upsertProfileRow(p).catch(()=>{});
     }
-  } catch(e) {
+  } catch (e) {
     console.warn('sheet sync on login failed', e);
   }
 
-  // 6) حفظ توقيت الدخول وتنبيه (مثل النسخة السابقة)
   p.lastLogin = new Date().toISOString();
   saveData(DB);
 
   (async ()=>{
     try{
       const text = `تسجيل دخول:\nالاسم: ${p.name || 'غير معروف'}\nالرقم الشخصي: ${p.personalNumber}\nالهاتف: ${p.phone || 'لا يوجد'}\nالبريد: ${p.email || 'لا يوجد'}\nالوقت: ${p.lastLogin}`;
-      await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
+      const r = await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
         method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ chat_id: CFG.BOT_LOGIN_REPORT_CHAT, text })
-      }).catch(()=>null);
+      });
+      const d = await r.json().catch(()=>null);
+      console.log('login notify result:', d);
     }catch(e){ console.warn('send login notify failed', e); }
   })();
 
-  // 7) رجّع البروفايل للعميل (يحتوي personalNumber و balance)
-  return res.json({ ok:true, profile: p });
+  return res.json({ ok:true, profile:p });
+});
+
+app.get('/api/profile/:personal', (req,res)=>{
+  const p = findProfileByPersonal(req.params.personal);
+  if(!p) return res.status(404).json({ ok:false, error:'not found' });
+  res.json({ ok:true, profile:p });
 });
 
 app.post('/api/profile/request-edit', async (req,res)=>{
@@ -576,56 +537,6 @@ app.post('/api/notifications/mark-read/:personal?', (req, res) => {
 
   saveData(DB);
   return res.json({ ok:true });
-});
-
-// Search profile (Sheets first, then local DB fallback)
-app.get('/api/profile/search/:personal', async (req, res) => {
-  const personal = String(req.params.personal || '').trim();
-  if (!personal) return res.status(400).json({ ok: false, error: 'missing_personal' });
-
-  try {
-    // 1) Try Google Sheets first (if initialized)
-    if (sheetsClient && SPREADSHEET_ID) {
-      try {
-        const sheetProf = await getProfileFromSheet(personal);
-        if (sheetProf) {
-          return res.json({
-            ok: true,
-            source: 'sheets',
-            profile: {
-              personalNumber: String(sheetProf.personalNumber || personal),
-              name: String(sheetProf.name || ''),
-              balance: Number(sheetProf.balance || 0)
-            }
-          });
-        }
-      } catch (e) {
-        console.warn('search: sheets lookup failed', e);
-        // continue to fallback
-      }
-    }
-
-    // 2) Fallback to local DB
-    const local = findProfileByPersonal(personal);
-    if (local) {
-      return res.json({
-        ok: true,
-        source: 'local',
-        profile: {
-          personalNumber: String(local.personalNumber || personal),
-          name: String(local.name || ''),
-          balance: Number(local.balance || 0)
-        }
-      });
-    }
-
-    // 3) Not found
-    return res.status(404).json({ ok: false, error: 'not_found' });
-
-  } catch (err) {
-    console.error('profile search error', err);
-    return res.status(500).json({ ok: false, error: 'server_error' });
-  }
 });
 
 app.post('/api/notifications/clear', (req,res)=>{
