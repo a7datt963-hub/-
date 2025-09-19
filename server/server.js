@@ -302,19 +302,63 @@ app.post('/api/register', async (req,res)=>{
 });
 
 // login
+// login (محدّث) — يدعم البحث بالمجموعة name/email/password/phone
 app.post('/api/login', async (req,res)=>{
-  const { personalNumber, email, password } = req.body || {};
+  const { personalNumber, email, password, name, phone } = req.body || {};
   let p = null;
-  if(personalNumber) p = findProfileByPersonal(personalNumber);
-  else if(email) p = DB.profiles.find(x => x.email && x.email.toLowerCase() === String(email).toLowerCase()) || null;
-  if(!p) return res.status(404).json({ ok:false, error:'not_found' });
-  if(typeof p.password !== 'undefined' && String(p.password).length > 0){
-    if(typeof password === 'undefined' || String(password) !== String(p.password)){
+
+  // 1) إذا أعطانا personalNumber نستخدمه مباشرة (خيار سريع)
+  if(personalNumber){
+    p = findProfileByPersonal(personalNumber);
+  } else {
+    // 2) حاول إيجاد ملف يطابق الحقول المرسلة (نعتبر المطابقة دقيقة على الحقول المرسلة)
+    p = DB.profiles.find(x => {
+      // إذا أرسلت إيميل وموجود في السجل: اعتبره مطابقاً بشكل أقوى
+      if(email && x.email && x.email.toLowerCase() === String(email).toLowerCase()){
+        // إذا يوجد password في السجل وتَوفّر في الطلب فتأكد منه لاحقاً
+        return true;
+      }
+      // وإلا: تحقق من كل الحقول التي أرسلتها (إذا أرسلتها)
+      let ok = true;
+      if(name) ok = ok && String(x.name || '') === String(name);
+      if(phone) ok = ok && String(x.phone || '') === String(phone);
+      if(email) ok = ok && String((x.email||'').toLowerCase()) === String((email||'').toLowerCase());
+      if(password) ok = ok && (typeof x.password !== 'undefined' ? String(x.password) === String(password) : false);
+      return ok;
+    }) || null;
+  }
+
+  // 3) لو وجد ملف وتبين أن له كلمة سر مسجلة وتقدّم المستخدم بكلمة سر خاطئة => 401
+  if(p && typeof p.password !== 'undefined' && String(p.password).length > 0) {
+    if(typeof password === 'undefined' || String(password) !== String(p.password)) {
       return res.status(401).json({ ok:false, error:'invalid_password' });
     }
   }
 
-  // sync from sheet if available
+  // 4) إذا ما وجدنا ملف: ننشئ ملف جديد برقم شخصي عشوائي فريد (7 أرقام)
+  if(!p){
+    let newPersonal;
+    do {
+      newPersonal = String(Math.floor(1000000 + Math.random() * 9000000)); // 7 أرقام
+    } while(findProfileByPersonal(newPersonal));
+
+    p = {
+      personalNumber: String(newPersonal),
+      name: name || 'غير معروف',
+      email: email || '',
+      password: password || '',
+      phone: phone || '',
+      balance: 0,
+      canEdit: false
+    };
+    DB.profiles.push(p);
+    saveData(DB);
+
+    // أضف صف في الـ Google Sheets (غير حرج لو فشل)
+    upsertProfileRow(p).catch(()=>{});
+  }
+
+  // 5) مزامنة الرصيد والبيانات من Google Sheets إن وُجد صف مطابق للـ personalNumber
   try {
     const sheetProf = await getProfileFromSheet(String(p.personalNumber));
     if (sheetProf) {
@@ -323,33 +367,28 @@ app.post('/api/login', async (req,res)=>{
       p.email = p.email || sheetProf.email || p.email;
       saveData(DB);
     } else {
+      // لو ما في صف — نُحاول كتابة الملف للـ Sheet (upsert)
       upsertProfileRow(p).catch(()=>{});
     }
-  } catch (e) {
+  } catch(e) {
     console.warn('sheet sync on login failed', e);
   }
 
+  // 6) حفظ توقيت الدخول وتنبيه (مثل النسخة السابقة)
   p.lastLogin = new Date().toISOString();
   saveData(DB);
 
   (async ()=>{
     try{
       const text = `تسجيل دخول:\nالاسم: ${p.name || 'غير معروف'}\nالرقم الشخصي: ${p.personalNumber}\nالهاتف: ${p.phone || 'لا يوجد'}\nالبريد: ${p.email || 'لا يوجد'}\nالوقت: ${p.lastLogin}`;
-      const r = await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
+      await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
         method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ chat_id: CFG.BOT_LOGIN_REPORT_CHAT, text })
-      });
-      const d = await r.json().catch(()=>null);
-      console.log('login notify result:', d);
+      }).catch(()=>null);
     }catch(e){ console.warn('send login notify failed', e); }
   })();
 
-  return res.json({ ok:true, profile:p });
-});
-
-app.get('/api/profile/:personal', (req,res)=>{
-  const p = findProfileByPersonal(req.params.personal);
-  if(!p) return res.status(404).json({ ok:false, error:'not found' });
-  res.json({ ok:true, profile:p });
+  // 7) رجّع البروفايل للعميل (يحتوي personalNumber و balance)
+  return res.json({ ok:true, profile: p });
 });
 
 app.post('/api/profile/request-edit', async (req,res)=>{
