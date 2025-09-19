@@ -578,6 +578,56 @@ app.post('/api/notifications/mark-read/:personal?', (req, res) => {
   return res.json({ ok:true });
 });
 
+// Search profile (Sheets first, then local DB fallback)
+app.get('/api/profile/search/:personal', async (req, res) => {
+  const personal = String(req.params.personal || '').trim();
+  if (!personal) return res.status(400).json({ ok: false, error: 'missing_personal' });
+
+  try {
+    // 1) Try Google Sheets first (if initialized)
+    if (sheetsClient && SPREADSHEET_ID) {
+      try {
+        const sheetProf = await getProfileFromSheet(personal);
+        if (sheetProf) {
+          return res.json({
+            ok: true,
+            source: 'sheets',
+            profile: {
+              personalNumber: String(sheetProf.personalNumber || personal),
+              name: String(sheetProf.name || ''),
+              balance: Number(sheetProf.balance || 0)
+            }
+          });
+        }
+      } catch (e) {
+        console.warn('search: sheets lookup failed', e);
+        // continue to fallback
+      }
+    }
+
+    // 2) Fallback to local DB
+    const local = findProfileByPersonal(personal);
+    if (local) {
+      return res.json({
+        ok: true,
+        source: 'local',
+        profile: {
+          personalNumber: String(local.personalNumber || personal),
+          name: String(local.name || ''),
+          balance: Number(local.balance || 0)
+        }
+      });
+    }
+
+    // 3) Not found
+    return res.status(404).json({ ok: false, error: 'not_found' });
+
+  } catch (err) {
+    console.error('profile search error', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+
 app.post('/api/notifications/clear', (req,res)=>{
   const { personal } = req.body || {};
   if(!personal) return res.status(400).json({ ok:false, error:'missing personal' });
