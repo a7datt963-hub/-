@@ -380,42 +380,37 @@ app.post('/api/register', async (req,res)=>{
 });
 
 // login (محدث: إذا لم يوجد الملف يسجّل واحد جديد تلقائياً)
-app.post('/api/login', async (req,res)=>{
+// --- START: single /api/login handler (paste and keep only this one) ---
+app.post('/api/login', async (req, res) => {
   try {
-    // نقبل personalNumber أو personal أو email
     const { personalNumber, personal, email, password } = req.body || {};
     const personalKey = personalNumber || personal || null;
 
-    // حاول إيجاد البروفايل أولاً
+    // إيجاد البروفايل
     let p = null;
     if (personalKey) p = findProfileByPersonal(personalKey);
     else if (email) p = DB.profiles.find(x => x.email && x.email.toLowerCase() === String(email).toLowerCase()) || null;
 
-    // إذا لم يوجد: أنشئ بروفايل جديد (تسجيل تلقائي)
-// إذا لم يوجد: أنشئ بروفايل جديد (تسجيل تلقائي)
-if (!p) {
-  let newPersonal = personalKey ? String(personalKey) : '';
-  // تحقق من الطول
-  if (!/^\d{7}$/.test(newPersonal)) {
-    // لو فارغ أو مش 7 خانات، نولّد رقم عشوائي من 7 خانات
-    newPersonal = String(Math.floor(1000000 + Math.random() * 9000000));
-  }
-
-  p = {
-    personalNumber: newPersonal,
-    name: req.body.name || 'مستخدم جديد',
-    email: email || '',
-    password: password || '',
-    phone: req.body.phone || '',
-    balance: 0,
-    canEdit: false
-  };
-  DB.profiles.push(p);
-  saveData(DB);
-  try { upsertProfileRow && upsertProfileRow(p).catch(()=>{}); } catch(e){}
-}
+    // إذا لم يوجد: أنشئ بروفايل جديد مع ضمان رقم شخصي 7 خانات
+    if (!p) {
+      let newPersonal = personalKey ? String(personalKey) : '';
+      if (!/^\d{7}$/.test(newPersonal)) {
+        newPersonal = String(Math.floor(1000000 + Math.random() * 9000000)); // 7 خانات عشوائية
+      }
+      p = {
+        personalNumber: newPersonal,
+        name: req.body.name || 'مستخدم جديد',
+        email: email || '',
+        password: password || '',
+        phone: req.body.phone || '',
+        balance: 0,
+        canEdit: false
+      };
+      DB.profiles.push(p);
+      saveData(DB);
+      try { upsertProfileRow && upsertProfileRow(p).catch(()=>{}); } catch(e){}
     } else {
-      // وجدناه: إذا له باسورد مخزن فنتأكد منه
+      // إذا وجد: تحقق من كلمة السر إن كانت مخزنة
       if (typeof p.password !== 'undefined' && String(p.password).length > 0) {
         if (typeof password === 'undefined' || String(password) !== String(p.password)) {
           return res.status(401).json({ ok:false, error:'invalid_password' });
@@ -423,7 +418,7 @@ if (!p) {
       }
     }
 
-    // --- مزامنة من الشيت لو متاحة (كما في الكود الأصلي) ---
+    // مزامنة مع الشيت (آمنة مع try/catch)
     try {
       const sheetProf = await getProfileFromSheet(String(p.personalNumber));
       if (sheetProf) {
@@ -439,7 +434,7 @@ if (!p) {
       console.warn('sheet sync on login failed', e);
     }
 
-    // --- تعيين loginNumber إن لم يكن موجوداً ---
+    // تعيين loginNumber إن لم يكن موجوداً
     try {
       if (!p.loginNumber) {
         let assigned = null;
@@ -463,7 +458,18 @@ if (!p) {
     p.lastLogin = new Date().toISOString();
     saveData(DB);
 
-    // إشعار تيليجرام غير معيّن لا يوقف التنفيذ (احتياطي كما في الكود الأصلي)
+    // إخراج الحقول المطلوبة للواجهة (تظهر كلمة السر ورقم الهاتف كما طلبت)
+    const out = {
+      personalNumber: p.personalNumber,
+      loginNumber: p.loginNumber || null,
+      balance: Number(p.balance || 0),
+      name: p.name || '',
+      email: p.email || '',
+      phone: p.phone || '',
+      password: p.password || ''
+    };
+
+    // إرسال إشعار تسجيل دخول (غير حرج - لا يمنع الاستجابة)
     (async ()=>{
       try{
         const text = `تسجيل دخول/تسجيل جديد:\nالاسم: ${p.name || 'غير معروف'}\nالرقم الشخصي: ${p.personalNumber}\nرقم الدخول: ${p.loginNumber || '---'}\nالهاتف: ${p.phone || 'لا يوجد'}\nالبريد: ${p.email || 'لا يوجد'}\nالوقت: ${p.lastLogin}`;
@@ -473,23 +479,14 @@ if (!p) {
       }catch(e){ /* ignore */ }
     })();
 
-    // أعد بيانات البروفايل للواجهة - فقط الحقول المهمة
-const out = {
-  personalNumber: p.personalNumber,
-  loginNumber: p.loginNumber || null,
-  balance: Number(p.balance || 0),
-  name: p.name || '',
-  email: p.email || '',
-  phone: p.phone || '',
-  password: p.password || ''
-};
     return res.json({ ok:true, profile: out });
 
-  } catch(err) {
+  } catch (err) {
     console.error('login handler error', err);
     return res.status(500).json({ ok:false, error: err.message || 'server_error' });
   }
 });
+// --- END handler ---
 
 app.get('/api/profile/:personal', (req,res)=>{
   const p = findProfileByPersonal(req.params.personal);
