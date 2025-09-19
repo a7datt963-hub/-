@@ -379,75 +379,108 @@ app.post('/api/register', async (req,res)=>{
   return res.json({ ok:true, profile:p });
 });
 
-// login
+// login (محدث: إذا لم يوجد الملف يسجّل واحد جديد تلقائياً)
 app.post('/api/login', async (req,res)=>{
-  const { personalNumber, email, password } = req.body || {};
-  let p = null;
-  if(personalNumber) p = findProfileByPersonal(personalNumber);
-  else if(email) p = DB.profiles.find(x => x.email && x.email.toLowerCase() === String(email).toLowerCase()) || null;
-  if(!p) return res.status(404).json({ ok:false, error:'not_found' });
-  if(typeof p.password !== 'undefined' && String(p.password).length > 0){
-    if(typeof password === 'undefined' || String(password) !== String(p.password)){
-      return res.status(401).json({ ok:false, error:'invalid_password' });
-    }
-  }
-
-  // sync from sheet if available
   try {
-    const sheetProf = await getProfileFromSheet(String(p.personalNumber));
-    if (sheetProf) {
-      p.balance = Number(sheetProf.balance || 0);
-      p.name = p.name || sheetProf.name || p.name;
-      p.email = p.email || sheetProf.email || p.email;
-      // copy loginNumber from sheet if present
-      if (sheetProf.loginNumber) p.loginNumber = Number(sheetProf.loginNumber);
+    // نقبل personalNumber أو personal أو email
+    const { personalNumber, personal, email, password } = req.body || {};
+    const personalKey = personalNumber || personal || null;
+
+    // حاول إيجاد البروفايل أولاً
+    let p = null;
+    if (personalKey) p = findProfileByPersonal(personalKey);
+    else if (email) p = DB.profiles.find(x => x.email && x.email.toLowerCase() === String(email).toLowerCase()) || null;
+
+    // إذا لم يوجد: أنشئ بروفايل جديد (تسجيل تلقائي)
+    if (!p) {
+      // نحتاج قيمة شخصية واحدة على الأقل: personalNumber أو email
+      const newPersonal = personalKey ? String(personalKey) : String(Date.now()); // لو لم يعطي المستخدم رقم شخصي نولد واحد مؤقت
+      p = {
+        personalNumber: newPersonal,
+        name: req.body.name || 'مستخدم جديد',
+        email: email || '',
+        password: password || '',
+        phone: req.body.phone || '',
+        balance: 0,
+        canEdit: false
+      };
+      DB.profiles.push(p);
       saveData(DB);
+      // حاول إدخال الصف في الشيت (إن كانت الوظيفة معرفة)
+      try { upsertProfileRow && upsertProfileRow(p).catch(()=>{}); } catch(e){/* ignore */ }
     } else {
-      upsertProfileRow(p).catch(()=>{});
-    }
-  } catch (e) {
-    console.warn('sheet sync on login failed', e);
-  }
-
-  // assign loginNumber if missing
-  try {
-    if (!p.loginNumber) {
-      let assigned = null;
-      // try to assign in sheet
-      assigned = await assignLoginNumberInProfilesSheet(String(p.personalNumber));
-      if (assigned) {
-        p.loginNumber = Number(assigned);
-        // update sheet row fully (ensures name/balance etc. preserved)
-        upsertProfileRow(p).catch(()=>{});
-      } else {
-        // fallback local
-        p.loginNumber = assignLoginNumberLocal(String(p.personalNumber));
+      // وجدناه: إذا له باسورد مخزن فنتأكد منه
+      if (typeof p.password !== 'undefined' && String(p.password).length > 0) {
+        if (typeof password === 'undefined' || String(password) !== String(p.password)) {
+          return res.status(401).json({ ok:false, error:'invalid_password' });
+        }
       }
-      saveData(DB);
     }
-  } catch (e) {
-    console.warn('login-number assign/check failed', e);
-    if (!p.loginNumber) {
-      p.loginNumber = assignLoginNumberLocal(String(p.personalNumber));
-      saveData(DB);
+
+    // --- مزامنة من الشيت لو متاحة (كما في الكود الأصلي) ---
+    try {
+      const sheetProf = await getProfileFromSheet(String(p.personalNumber));
+      if (sheetProf) {
+        p.balance = Number(sheetProf.balance || 0);
+        p.name = p.name || sheetProf.name || p.name;
+        p.email = p.email || sheetProf.email || p.email;
+        if (sheetProf.loginNumber) p.loginNumber = Number(sheetProf.loginNumber);
+        saveData(DB);
+      } else {
+        upsertProfileRow && upsertProfileRow(p).catch(()=>{});
+      }
+    } catch (e) {
+      console.warn('sheet sync on login failed', e);
     }
+
+    // --- تعيين loginNumber إن لم يكن موجوداً ---
+    try {
+      if (!p.loginNumber) {
+        let assigned = null;
+        try { assigned = await assignLoginNumberInProfilesSheet(String(p.personalNumber)); } catch(e){ assigned = null; }
+        if (assigned) {
+          p.loginNumber = Number(assigned);
+          upsertProfileRow && upsertProfileRow(p).catch(()=>{});
+        } else {
+          p.loginNumber = assignLoginNumberLocal(String(p.personalNumber));
+        }
+        saveData(DB);
+      }
+    } catch (e) {
+      console.warn('login-number assign/check failed', e);
+      if (!p.loginNumber) {
+        p.loginNumber = assignLoginNumberLocal(String(p.personalNumber));
+        saveData(DB);
+      }
+    }
+
+    p.lastLogin = new Date().toISOString();
+    saveData(DB);
+
+    // إشعار تيليجرام غير معيّن لا يوقف التنفيذ (احتياطي كما في الكود الأصلي)
+    (async ()=>{
+      try{
+        const text = `تسجيل دخول/تسجيل جديد:\nالاسم: ${p.name || 'غير معروف'}\nالرقم الشخصي: ${p.personalNumber}\nرقم الدخول: ${p.loginNumber || '---'}\nالهاتف: ${p.phone || 'لا يوجد'}\nالبريد: ${p.email || 'لا يوجد'}\nالوقت: ${p.lastLogin}`;
+        await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
+          method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ chat_id: CFG.BOT_LOGIN_REPORT_CHAT, text })
+        }).then(r => r.json().catch(()=>null)).catch(()=>null);
+      }catch(e){ /* ignore */ }
+    })();
+
+    // أعد بيانات البروفايل للواجهة - فقط الحقول المهمة
+    const out = {
+      personalNumber: p.personalNumber,
+      loginNumber: p.loginNumber || null,
+      balance: Number(p.balance || 0),
+      name: p.name || '',
+      email: p.email || ''
+    };
+    return res.json({ ok:true, profile: out });
+
+  } catch(err) {
+    console.error('login handler error', err);
+    return res.status(500).json({ ok:false, error: err.message || 'server_error' });
   }
-
-  p.lastLogin = new Date().toISOString();
-  saveData(DB);
-
-  (async ()=>{
-    try{
-      const text = `تسجيل دخول:\nالاسم: ${p.name || 'غير معروف'}\nالرقم الشخصي: ${p.personalNumber}\nرقم الدخول: ${p.loginNumber || '---'}\nالهاتف: ${p.phone || 'لا يوجد'}\nالبريد: ${p.email || 'لا يوجد'}\nالوقت: ${p.lastLogin}`;
-      const r = await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
-        method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ chat_id: CFG.BOT_LOGIN_REPORT_CHAT, text })
-      });
-      const d = await r.json().catch(()=>null);
-      console.log('login notify result:', d);
-    }catch(e){ console.warn('send login notify failed', e); }
-  })();
-
-  return res.json({ ok:true, profile:p });
 });
 
 app.get('/api/profile/:personal', (req,res)=>{
