@@ -392,22 +392,28 @@ app.post('/api/login', async (req,res)=>{
     else if (email) p = DB.profiles.find(x => x.email && x.email.toLowerCase() === String(email).toLowerCase()) || null;
 
     // إذا لم يوجد: أنشئ بروفايل جديد (تسجيل تلقائي)
-    if (!p) {
-      // نحتاج قيمة شخصية واحدة على الأقل: personalNumber أو email
-      const newPersonal = personalKey ? String(personalKey) : String(Date.now()); // لو لم يعطي المستخدم رقم شخصي نولد واحد مؤقت
-      p = {
-        personalNumber: newPersonal,
-        name: req.body.name || 'مستخدم جديد',
-        email: email || '',
-        password: password || '',
-        phone: req.body.phone || '',
-        balance: 0,
-        canEdit: false
-      };
-      DB.profiles.push(p);
-      saveData(DB);
-      // حاول إدخال الصف في الشيت (إن كانت الوظيفة معرفة)
-      try { upsertProfileRow && upsertProfileRow(p).catch(()=>{}); } catch(e){/* ignore */ }
+// إذا لم يوجد: أنشئ بروفايل جديد (تسجيل تلقائي)
+if (!p) {
+  let newPersonal = personalKey ? String(personalKey) : '';
+  // تحقق من الطول
+  if (!/^\d{7}$/.test(newPersonal)) {
+    // لو فارغ أو مش 7 خانات، نولّد رقم عشوائي من 7 خانات
+    newPersonal = String(Math.floor(1000000 + Math.random() * 9000000));
+  }
+
+  p = {
+    personalNumber: newPersonal,
+    name: req.body.name || 'مستخدم جديد',
+    email: email || '',
+    password: password || '',
+    phone: req.body.phone || '',
+    balance: 0,
+    canEdit: false
+  };
+  DB.profiles.push(p);
+  saveData(DB);
+  try { upsertProfileRow && upsertProfileRow(p).catch(()=>{}); } catch(e){}
+}
     } else {
       // وجدناه: إذا له باسورد مخزن فنتأكد منه
       if (typeof p.password !== 'undefined' && String(p.password).length > 0) {
@@ -468,13 +474,15 @@ app.post('/api/login', async (req,res)=>{
     })();
 
     // أعد بيانات البروفايل للواجهة - فقط الحقول المهمة
-    const out = {
-      personalNumber: p.personalNumber,
-      loginNumber: p.loginNumber || null,
-      balance: Number(p.balance || 0),
-      name: p.name || '',
-      email: p.email || ''
-    };
+const out = {
+  personalNumber: p.personalNumber,
+  loginNumber: p.loginNumber || null,
+  balance: Number(p.balance || 0),
+  name: p.name || '',
+  email: p.email || '',
+  phone: p.phone || '',
+  password: p.password || ''
+};
     return res.json({ ok:true, profile: out });
 
   } catch(err) {
