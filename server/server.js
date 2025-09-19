@@ -1,6 +1,7 @@
 /**
  * server/server.js
  * نسخة معدّلة: إصلاحات login، charge, genericBotReplyHandler (charges)، poll loop، retry initSheets.
+ * مضافة ميزة: loginNumber مخزّن في العمود G بورقة Profiles (A..G)
  */
 
 const express = require('express');
@@ -50,14 +51,14 @@ setInterval(() => {
 const SPREADSHEET_ID = process.env.SHEET_ID || null;
 
 /**
- * اقرأ صف البروفايل من شيت Profiles وترجعه كـ object أو null
+ * اقرأ صف البروفايل من شيت Profiles (A..G) وترجعه كـ object أو null
  */
 async function getProfileFromSheet(personal) {
   if (!sheetsClient || !SPREADSHEET_ID) return null;
   try {
     const resp = await sheetsClient.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
-      range: 'Profiles!A2:F10000',
+      range: 'Profiles!A2:G10000',
     });
     const rows = (resp.data && resp.data.values) || [];
     for (let i = 0; i < rows.length; i++) {
@@ -70,7 +71,8 @@ async function getProfileFromSheet(personal) {
           email: r[2] || '',
           password: r[3] || '',
           phone: r[4] || '',
-          balance: Number(r[5] || 0)
+          balance: Number(r[5] || 0),
+          loginNumber: (r[6] != null && String(r[6]).trim() !== '') ? Number(r[6]) : null
         };
       }
     }
@@ -82,7 +84,7 @@ async function getProfileFromSheet(personal) {
 }
 
 /**
- * اضف او حدّث صف في الشيت (upsert)
+ * اضف او حدّث صف في الشيت (upsert) — يكتب الآن العمود G = loginNumber
  */
 async function upsertProfileRow(profile) {
   if (!sheetsClient || !SPREADSHEET_ID) return false;
@@ -94,10 +96,11 @@ async function upsertProfileRow(profile) {
       profile.email || '',
       profile.password || '',
       profile.phone || '',
-      String(profile.balance == null ? 0 : profile.balance)
+      String(profile.balance == null ? 0 : profile.balance),
+      profile.loginNumber != null ? String(profile.loginNumber) : ''
     ];
     if (existing && existing.rowIndex) {
-      const range = `Profiles!A${existing.rowIndex}:F${existing.rowIndex}`;
+      const range = `Profiles!A${existing.rowIndex}:G${existing.rowIndex}`;
       await sheetsClient.spreadsheets.values.update({
         spreadsheetId: SPREADSHEET_ID,
         range,
@@ -107,7 +110,7 @@ async function upsertProfileRow(profile) {
     } else {
       await sheetsClient.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Profiles!A2:F2',
+        range: 'Profiles!A2:G2',
         valueInputOption: 'RAW',
         insertDataOption: 'INSERT_ROWS',
         requestBody: { values: [values] }
@@ -144,6 +147,81 @@ async function updateBalanceInSheet(personal, newBalance) {
     console.warn('updateBalanceInSheet error', e);
     return false;
   }
+}
+
+/**
+ * يعين رقم دخول متسلسل في العمود G داخل Profiles
+ * - إن وُجد رقم مسبقًا في الصف يرجع الرقم
+ * - إذا لم يوجد، يحسب next = count(non-empty G) + 1، ثم يكتب الرقم في صف المستخدم (أو يضيف صف جديد)
+ * - يرجع الرقم (Number) أو null لو فشل
+ */
+async function assignLoginNumberInProfilesSheet(personal) {
+  if (!sheetsClient || !SPREADSHEET_ID) return null;
+  try {
+    const existing = await getProfileFromSheet(personal);
+    if (existing && existing.loginNumber) return Number(existing.loginNumber);
+
+    // جلب كل قيم العمود G
+    const resp = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Profiles!G2:G10000',
+    });
+    const rows = (resp.data && resp.data.values) || [];
+
+    // حساب الخانات المملوءة في G
+    let filled = 0;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i] && String(rows[i][0] || '').trim() !== '') filled++;
+    }
+    const nextNumber = filled + 1;
+
+    if (existing && existing.rowIndex) {
+      // نكتب الرقم في عمود G لنفس الصف
+      const range = `Profiles!G${existing.rowIndex}`;
+      await sheetsClient.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[ String(nextNumber) ]] }
+      });
+      return nextNumber;
+    } else {
+      // لم نجد صفًا مسبقًا — نضيف صفًا جديدًا (A..G) مع loginNumber
+      await sheetsClient.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Profiles!A2:G2',
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: [[ String(personal), '', '', '', '', '0', String(nextNumber) ]] }
+      });
+      return nextNumber;
+    }
+  } catch (e) {
+    console.warn('assignLoginNumberInProfilesSheet error', e);
+    return null;
+  }
+}
+
+/**
+ * fallback محلي: لو Sheets غير متوفرة، نقوم بتعيين رقم دخول محلي
+ * - يتحقق من DB.profiles إذا في رقم لهذا الشخص يرجعه
+ * - وإلا يحسب max(loginNumber) الموجود ويعطي التالي
+ */
+function assignLoginNumberLocal(personal) {
+  let prof = findProfileByPersonal(personal);
+  if (!prof) prof = ensureProfile(personal);
+
+  if (prof.loginNumber) return Number(prof.loginNumber);
+
+  let maxNum = 0;
+  for (const p of DB.profiles) {
+    const n = Number(p.loginNumber || 0);
+    if (!isNaN(n) && n > maxNum) maxNum = n;
+  }
+  const next = maxNum + 1 || 1;
+  prof.loginNumber = next;
+  saveData(DB);
+  return next;
 }
 
 const app = express();
@@ -321,6 +399,8 @@ app.post('/api/login', async (req,res)=>{
       p.balance = Number(sheetProf.balance || 0);
       p.name = p.name || sheetProf.name || p.name;
       p.email = p.email || sheetProf.email || p.email;
+      // copy loginNumber from sheet if present
+      if (sheetProf.loginNumber) p.loginNumber = Number(sheetProf.loginNumber);
       saveData(DB);
     } else {
       upsertProfileRow(p).catch(()=>{});
@@ -329,12 +409,36 @@ app.post('/api/login', async (req,res)=>{
     console.warn('sheet sync on login failed', e);
   }
 
+  // assign loginNumber if missing
+  try {
+    if (!p.loginNumber) {
+      let assigned = null;
+      // try to assign in sheet
+      assigned = await assignLoginNumberInProfilesSheet(String(p.personalNumber));
+      if (assigned) {
+        p.loginNumber = Number(assigned);
+        // update sheet row fully (ensures name/balance etc. preserved)
+        upsertProfileRow(p).catch(()=>{});
+      } else {
+        // fallback local
+        p.loginNumber = assignLoginNumberLocal(String(p.personalNumber));
+      }
+      saveData(DB);
+    }
+  } catch (e) {
+    console.warn('login-number assign/check failed', e);
+    if (!p.loginNumber) {
+      p.loginNumber = assignLoginNumberLocal(String(p.personalNumber));
+      saveData(DB);
+    }
+  }
+
   p.lastLogin = new Date().toISOString();
   saveData(DB);
 
   (async ()=>{
     try{
-      const text = `تسجيل دخول:\nالاسم: ${p.name || 'غير معروف'}\nالرقم الشخصي: ${p.personalNumber}\nالهاتف: ${p.phone || 'لا يوجد'}\nالبريد: ${p.email || 'لا يوجد'}\nالوقت: ${p.lastLogin}`;
+      const text = `تسجيل دخول:\nالاسم: ${p.name || 'غير معروف'}\nالرقم الشخصي: ${p.personalNumber}\nرقم الدخول: ${p.loginNumber || '---'}\nالهاتف: ${p.phone || 'لا يوجد'}\nالبريد: ${p.email || 'لا يوجد'}\nالوقت: ${p.lastLogin}`;
       const r = await fetch(`https://api.telegram.org/bot${CFG.BOT_LOGIN_REPORT_TOKEN}/sendMessage`, {
         method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ chat_id: CFG.BOT_LOGIN_REPORT_CHAT, text })
       });
